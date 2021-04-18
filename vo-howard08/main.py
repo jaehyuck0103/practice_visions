@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Dict, List
 
 import cv2
 import matplotlib.pyplot as plt
@@ -6,11 +7,19 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 
-fig = plt.figure()
-ax_3d = fig.add_subplot(111)
+# Init plots
+fig_birdeye = plt.figure("BirdEye View")
+ax_birdeye = fig_birdeye.add_subplot()
+ax_birdeye.set_xlabel("x(m)")
+ax_birdeye.set_ylabel("z(m)")
+
+fig_traj = plt.figure("Trajectory")
+ax_traj = fig_traj.add_subplot()
+ax_traj.set_xlabel("x(m)")
+ax_traj.set_ylabel("z(m)")
 
 
-def imfuse(img1, img2):
+def imfuse(img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
     """
     img1, img2: gray img.
     matlab 스타일의 red-cyan blending
@@ -24,7 +33,7 @@ def imfuse(img1, img2):
     return np.stack([img2, img2, img1], axis=-1)
 
 
-def read_calib(calib_path):
+def read_calib(calib_path: Path) -> Dict[str, np.ndarray]:
     with open(calib_path) as fp:
         lines = fp.read().splitlines()
 
@@ -37,7 +46,7 @@ def read_calib(calib_path):
     return P_dict
 
 
-def homo_tf(A: np.array, x: np.array) -> np.array:
+def homo_tf(A: np.ndarray, x: np.ndarray) -> np.ndarray:
     """
     A: (?, D)
     x: (N, D-1)
@@ -55,7 +64,10 @@ def homo_tf(A: np.array, x: np.array) -> np.array:
     return y
 
 
-def find_potential_nodes(clique, M):
+def find_potential_nodes(clique: List[int], M: np.array) -> List[int]:
+    """
+    Find the set of matches compatible with all the matches already in the clique
+    """
 
     new_set = np.all(M[:, clique], axis=1)
 
@@ -64,10 +76,13 @@ def find_potential_nodes(clique, M):
 
     new_set = new_set.nonzero()[0]
 
-    return new_set
+    return new_set.tolist()
 
 
 def update_clique(potential_nodes, clique, M):
+    """
+    Add the match with the largeest number consistent matches
+    """
 
     num_matches = M[np.ix_(potential_nodes, potential_nodes)].sum(axis=1)
     max_match_node = potential_nodes[np.argmax(num_matches)]
@@ -76,38 +91,57 @@ def update_clique(potential_nodes, clique, M):
     return clique
 
 
-def obj_fun(PAR, F1, F2, W1, W2, P1):
-    # F1, F2 -> 2d coordinates of features in I1_l, I2_l
-    # W1, W2 -> 3d coordinates of the features that have been triangulated
-    # P1, P2 -> Projection matrices for the two cameras
-    # r, t -> 3x1 vectors, need to be varied for the minimization
-    r = PAR[:3]
-    t = PAR[3:]
+def obj_fun(param, F1, F2, W1, W2, K):
+    """
+    param(r, t) -> 6x1 vectors, need to be varied for the minimization
+    F1, F2: 2d coordinates of features in imgL_prev, imgL_next
+    W1, W2: 3d coordinates of the features that have been triangulated
+    K: Camera intrinsic
+    """
 
-    num_feats = len(F1)
-    reproj1 = np.zeros([num_feats, 3])
-    reproj2 = np.zeros([num_feats, 3])
+    r = param[:3]
+    t = param[3:]
 
     rot_mat = R.from_euler("ZXZ", r).as_matrix()
-    tran = np.zeros([4, 4])
-    tran[:3, :3] = rot_mat
-    tran[:3, 3] = t
-    tran[3, 3] = 1
+    RT = np.zeros([4, 4])
+    RT[:3, :3] = rot_mat
+    RT[:3, 3] = t
+    RT[3, 3] = 1
 
-    F1_repr = homo_tf(P1 @ tran, W2)
-    F2_repr = homo_tf(P1 @ np.linalg.inv(tran), W1)
+    F1_reprojected = homo_tf(K @ RT[:3], W2)
+    F2_reprojected = homo_tf(K @ np.linalg.inv(RT)[:3], W1)
 
-    reproj1 = F1 - F1_repr
-    reproj2 = F2 - F2_repr
+    reproj1 = F1 - F1_reprojected
+    reproj2 = F2 - F2_reprojected
 
     return np.concatenate([reproj1.flatten(), reproj2.flatten()])
 
 
-def bucket_features(image, h_break, w_break, num_corners):
+def bucket_features(
+    image: np.ndarray,
+    vert_splits: int,
+    horz_splits: int,
+    each_num_corners: int,
+) -> np.ndarray:
+    """
+
+    이미지를 균등하게 분할하여 각 영역마다 fast features를 뽑고,
+    각 영역에서 response가 큰 each_num_corners 갯수의 픽셀 좌표 모아서 반환.
+
+    Args:
+        image: input gray image
+        vert_splits: vertically 분할 갯수
+        horz_splits: horizontally 분할 갯수
+        each_num_corners: 각 영역에서 추출할 feature 갯수
+
+    Returns:
+        추출된 feature들의 좌표값 모음 of shape (num_features, 2)
+    """
+
     H, W = image.shape
 
-    ys = np.round(np.linspace(0, H + 1, num=h_break + 1)).astype(int)
-    xs = np.round(np.linspace(0, W + 1, num=w_break + 1)).astype(int)
+    ys = np.around(np.linspace(0, H + 1, num=vert_splits + 1)).astype(int)
+    xs = np.around(np.linspace(0, W + 1, num=horz_splits + 1)).astype(int)
 
     fast = cv2.FastFeatureDetector_create()
 
@@ -120,7 +154,7 @@ def bucket_features(image, h_break, w_break, num_corners):
             # Get key_pts of high responses
             key_pts = fast.detect(image, mask=mask)
             key_pts.sort(reverse=True, key=(lambda x: x.response))
-            key_pts = key_pts[:num_corners]
+            key_pts = key_pts[:each_num_corners]
             final_pts += key_pts
 
     final_pts = [x.pt for x in final_pts]
@@ -129,11 +163,29 @@ def bucket_features(image, h_break, w_break, num_corners):
     return final_pts
 
 
-def visodo(I1_l, I1_r, I2_l, I2_r, P_l, P_r):
+def visodo(
+    imgL_prev: np.ndarray,
+    imgR_prev: np.ndarray,
+    imgL_next: np.ndarray,
+    imgR_next: np.ndarray,
+    K: np.ndarray,
+    stereo_baseline_meters: float,
+) -> np.ndarray:
+    """연속된 stereo images를 입력받아 프레임 간 ego_motion 계산
 
-    H, W = I1_l.shape
+    Args:
+        img*: HxW input images
+        K: 3x3 camera intrinsic
 
-    # Parameters follow KITTI baseline
+    Returns:
+        ego_motion (4x4)
+    """
+
+    H, W = imgL_prev.shape
+
+    # --------------------------------
+    # Extract disparity maps
+    # --------------------------------
     stereo = cv2.StereoSGBM_create(
         numDisparities=128,
         blockSize=3,
@@ -144,155 +196,167 @@ def visodo(I1_l, I1_r, I2_l, I2_r, P_l, P_r):
         speckleWindowSize=100,
         speckleRange=32,
         disp12MaxDiff=1,
-    )
-    disparityMap1 = stereo.compute(I1_l, I1_r)
-    disparityMap2 = stereo.compute(I2_l, I2_r)
+    )  # Parameters follow KITTI baseline
+    disparity_map_prev = stereo.compute(imgL_prev, imgR_prev)
+    disaprity_map_next = stereo.compute(imgL_next, imgR_next)
 
     # opencv sgbm의 disparity는 int16으로 나오고, 원래 값에 16 곱해진 상태이다.
-    disparityMap1 = disparityMap1.astype(np.float32) / 16
-    disparityMap2 = disparityMap2.astype(np.float32) / 16
+    disparity_map_prev = disparity_map_prev.astype(np.float32) / 16
+    disaprity_map_next = disaprity_map_next.astype(np.float32) / 16
 
-    h_break = 4
-    w_break = 12
-    nCorners = 100
-    inlierThresh = 0.05  # 0.01
+    # ---------------------------
+    # Extract 2D features
+    # ---------------------------
+    # imgL_prev에서 features 위치 추출
+    pts2D_L_prev = bucket_features(imgL_prev, vert_splits=4, horz_splits=12, each_num_corners=100)
 
-    # feature 추출
-    points1_l = bucket_features(I1_l, h_break, w_break, nCorners)
-
-    # optical flow
-    points2_l, status, _ = cv2.calcOpticalFlowPyrLK(I1_l, I2_l, points1_l, None)
-    status = status.astype(np.bool).reshape(-1)
+    # features에 대해서 optical flow 뽑는다.
+    pts2D_L_next, status, _ = cv2.calcOpticalFlowPyrLK(imgL_prev, imgL_next, pts2D_L_prev, None)
+    status = status.astype(bool).reshape(-1)
 
     # LK 성공한 포인트들만 추린다.
-    points1_l = points1_l[status].astype(int)
-    points2_l = points2_l[status].astype(int)
+    pts2D_L_prev = pts2D_L_prev[status].round().astype(int)
+    pts2D_L_next = pts2D_L_next[status].round().astype(int)
 
-    # points2_l이 이미지 범위 넘어가면 필터링
+    # pts2D_L_next가 이미지 범위 넘어가면 필터 아웃
     in_img = (
-        (points2_l[:, 0] >= 0)
-        & (points2_l[:, 0] < W)
-        & (points2_l[:, 1] >= 0)
-        & (points2_l[:, 1] < H)
+        (pts2D_L_next[:, 0] >= 0)
+        & (pts2D_L_next[:, 0] < W)
+        & (pts2D_L_next[:, 1] >= 0)
+        & (pts2D_L_next[:, 1] < H)
     )
-    points1_l = points1_l[in_img]
-    points2_l = points2_l[in_img]
+    pts2D_L_prev = pts2D_L_prev[in_img]
+    pts2D_L_next = pts2D_L_next[in_img]
 
     # disparity 유효한 포인트들만 추린다.
-    points1_l = points1_l.astype(int)
-    points2_l = points2_l.astype(int)
     valid_disp = (
-        (disparityMap1[points1_l[:, 1], points1_l[:, 0]] > 0)
-        & (disparityMap1[points1_l[:, 1], points1_l[:, 0]] < 100)
-        & (disparityMap2[points2_l[:, 1], points2_l[:, 0]] > 0)
-        & (disparityMap2[points2_l[:, 1], points2_l[:, 0]] < 100)
+        (disparity_map_prev[pts2D_L_prev[:, 1], pts2D_L_prev[:, 0]] > 0)
+        & (disparity_map_prev[pts2D_L_prev[:, 1], pts2D_L_prev[:, 0]] < 100)
+        & (disaprity_map_next[pts2D_L_next[:, 1], pts2D_L_next[:, 0]] > 0)
+        & (disaprity_map_next[pts2D_L_next[:, 1], pts2D_L_next[:, 0]] < 100)
     )
-    points1_l = points1_l[valid_disp]
-    points2_l = points2_l[valid_disp]
+    pts2D_L_prev = pts2D_L_prev[valid_disp]
+    pts2D_L_next = pts2D_L_next[valid_disp]
 
-    disparities1 = disparityMap1[points1_l[:, 1], points1_l[:, 0]]
-    disparities2 = disparityMap2[points2_l[:, 1], points2_l[:, 0]]
+    disparities_prev = disparity_map_prev[pts2D_L_prev[:, 1], pts2D_L_prev[:, 0]]
+    disparities_next = disaprity_map_next[pts2D_L_next[:, 1], pts2D_L_next[:, 0]]
 
-    # Calc 3D points
-    baseline_meters = P_l[0, 3] / P_l[0, 0] - P_r[0, 3] / P_r[0, 0]
+    # ----------------------------
+    # Get 3D points of features
+    # ----------------------------
+    # Reprojection (Learning OpenCV3 p732)
     reprojection_mat = np.array(
         [
-            [1, 0, 0, -P_l[0, 2]],
-            [0, 1, 0, -P_l[1, 2]],
-            [0, 0, 0, P_l[0, 0]],
-            [0, 0, 1 / baseline_meters, 0],
+            [1, 0, 0, -K[0, 2]],
+            [0, 1, 0, -K[1, 2]],
+            [0, 0, 0, K[0, 0]],
+            [0, 0, 1 / stereo_baseline_meters, 0],
         ]
     )
 
-    points3D_1 = homo_tf(
+    pts3D_prev = homo_tf(
         reprojection_mat,
-        np.concatenate([points1_l, disparities1[:, np.newaxis]], axis=1),
+        np.concatenate([pts2D_L_prev, disparities_prev[:, np.newaxis]], axis=1),
     )
-    points3D_2 = homo_tf(
+    pts3D_next = homo_tf(
         reprojection_mat,
-        np.concatenate([points2_l, disparities2[:, np.newaxis]], axis=1),
+        np.concatenate([pts2D_L_next, disparities_next[:, np.newaxis]], axis=1),
     )
 
-    # filtering
+    # Filter out far points
     valid_pts = (
-        (np.abs(points3D_1[:, 0]) < 50)
-        & (np.abs(points3D_1[:, 1]) < 50)
-        & (np.abs(points3D_1[:, 2]) < 50)
-        & (np.abs(points3D_2[:, 0]) < 50)
-        & (np.abs(points3D_2[:, 1]) < 50)
-        & (np.abs(points3D_2[:, 2]) < 50)
+        (np.abs(pts3D_prev[:, 0]) < 50)
+        & (np.abs(pts3D_prev[:, 1]) < 50)
+        & (np.abs(pts3D_prev[:, 2]) < 50)
+        & (np.abs(pts3D_next[:, 0]) < 50)
+        & (np.abs(pts3D_next[:, 1]) < 50)
+        & (np.abs(pts3D_next[:, 2]) < 50)
     )
-
-    points1_l = points1_l[valid_pts]
-    points2_l = points2_l[valid_pts]
-    points3D_1 = points3D_1[valid_pts]
-    points3D_2 = points3D_2[valid_pts]
+    pts2D_L_prev = pts2D_L_prev[valid_pts]
+    pts2D_L_next = pts2D_L_next[valid_pts]
+    pts3D_prev = pts3D_prev[valid_pts]
+    pts3D_next = pts3D_next[valid_pts]
 
     num_feats = valid_pts.sum()
-    print("num_feats: ", num_feats)
+    print("num_filtred_features: ", num_feats)
 
-    I_blended = imfuse(I1_l, I2_l)
-    for pt1, pt2 in zip(points1_l, points2_l):
+    # ---------------------------
+    # Visualization
+    # ---------------------------
+    # Blended image
+    I_blended = imfuse(imgL_prev, imgL_next)
+    for pt1, pt2 in zip(pts2D_L_prev, pts2D_L_next):
         I_blended = cv2.line(I_blended, tuple(pt1), tuple(pt2), (0, 255, 0))
-    cv2.imshow("abc", I_blended)
+    cv2.imshow("Blended Image", I_blended)
     cv2.waitKey(1)
 
-    # 3d plot
-    ax_3d.clear()
-    ax_3d.scatter(points3D_1[:, 0], points3D_1[:, 2])
+    # Birdeye plot
+    ax_birdeye.clear()
+    ax_birdeye.scatter(pts3D_prev[:, 0], pts3D_prev[:, 2], s=1)
+    ax_birdeye.set_xlim(-25, 25)
+    ax_birdeye.set_ylim(0, 50)
 
-    # Consistency Matrix M
-    # Number of Row = Number of Columns = Number of Features
+    # --------------------------------------------------------
+    # Find the maximum inlier set
+    # --------------------------------------------------------
+    # Construct Consistency Matrix M (rows == cols == # of features)
+    #    A pair of matches is consistent if the distance bw two features in prev_frame is
+    #    identical to the distance bw the corresponding features in next_frame
     M = np.zeros([num_feats, num_feats])
 
+    consistency_thresh = 0.05  # 0.2  # 0.05  # 0.01
     for i in range(num_feats):
         M[i] = (
             abs(
-                np.sqrt(((points3D_2[i, :] - points3D_2) ** 2).sum(axis=1))
-                - np.sqrt(((points3D_1[i, :] - points3D_1) ** 2).sum(axis=1))
+                np.sqrt(((pts3D_next[i, :] - pts3D_next) ** 2).sum(axis=1))
+                - np.sqrt(((pts3D_prev[i, :] - pts3D_prev) ** 2).sum(axis=1))
             )
-            < inlierThresh
+            < consistency_thresh
         )
 
-    print(M.sum())
-
-    # Choose the node with the maximum degree
+    # Init clique to contain the match with the largest number of consistent matches
+    # (Choose the node with the maximum degree)
     first_node_idx = np.argmax(M.sum(axis=1))
     clique = [first_node_idx]
 
-    # Find the clique
+    # Find the maximum clique (NP-complete => Use sub-optimal algorim)
     potential_nodes = find_potential_nodes(clique, M)
-    """
     while len(potential_nodes) > 0:
         clique = update_clique(potential_nodes, clique, M)
         potential_nodes = find_potential_nodes(clique, M)
-    """
-    clique = potential_nodes
 
-    print("num_clieue: ", len(clique))
+    # 그냥 빠르게 처음 나온 potential_nodes를 clique으로 사용할 수도 있다...
+    # potential_nodes = find_potential_nodes(clique, M)
+    # clique = potential_nodes
 
-    new_cloud1 = points3D_1[clique, :]
-    new_cloud2 = points3D_2[clique, :]
-    new_feats1 = points1_l[clique, :]
-    new_feats2 = points2_l[clique, :]
+    print("clique size: ", len(clique))
 
-    for pt1, pt2 in zip(new_feats1, new_feats2):
+    pts3D_prev = pts3D_prev[clique, :]
+    pts3D_next = pts3D_next[clique, :]
+    pts2D_L_prev = pts2D_L_prev[clique, :]
+    pts2D_L_next = pts2D_L_next[clique, :]
+
+    # -----------------
+    # Visualization
+    # -----------------
+    for pt1, pt2 in zip(pts2D_L_prev, pts2D_L_next):
         I_blended = cv2.line(I_blended, tuple(pt1), tuple(pt2), (255, 0, 0))
-    cv2.imshow("abc", I_blended)
+    cv2.imshow("Blended Image", I_blended)
     cv2.waitKey(1)
 
-    # Optim
-    PAR0 = np.zeros(6)
-    PAR = least_squares(
+    # -----------------------------------
+    # Estimate Motion by LM Optimization
+    # -----------------------------------
+    param = least_squares(
         obj_fun,
-        PAR0,
-        args=(new_feats1, new_feats2, new_cloud1, new_cloud2, P_l),
+        x0=np.zeros(6),
+        args=(pts2D_L_prev, pts2D_L_next, pts3D_prev, pts3D_next, K),
         method="lm",
         max_nfev=1500,
     )
 
-    r = PAR.x[:3]
-    transl = PAR.x[3:]
+    r = param.x[:3]
+    transl = param.x[3:]
 
     rot_mat = R.from_euler("ZXZ", r).as_matrix()
     ego_motion = np.eye(4)
@@ -306,29 +370,34 @@ def main():
     seq = 0
     seq_dir = KITTI_PATH / "sequences" / f"{seq:02d}"
 
-    # init plot
-    _, ax = plt.subplots()
-    ax.set_xlabel("x(m)")
-    ax.set_ylabel("z(m)")
-
-    # read calibration
+    # Read 3x4 projection matrices after rectification
     calib_path = seq_dir / "calib.txt"
     P_dict = read_calib(calib_path)
 
     P0 = P_dict["P0"]
     P1 = P_dict["P1"]
 
-    # read gt poses
+    print(f"Projection Matrix P0\n{P0}\n")
+    print(f"Projection Matrix P1\n{P1}\n")
+
+    assert np.array_equal(P0[:3, :3], P1[:3, :3])
+    K = P0[:3, :3]
+    stereo_baseline_meters = P0[0, 3] / K[0, 0] - P1[0, 3] / K[0, 0]
+
+    print(f"Intrinsic Matrix K\n{K}\n")
+    print(f"Stereo baseline (meters): {stereo_baseline_meters}\n\n")
+
+    # Visualize GT poses
     pose_txt = KITTI_PATH / "poses" / f"{seq:02d}.txt"
     gt_poses = np.loadtxt(pose_txt).reshape(-1, 3, 4)
-    ax.plot(gt_poses[:, 0, 3], gt_poses[:, 2, 3])
+    ax_traj.plot(gt_poses[:, 0, 3], gt_poses[:, 2, 3], color="blue")
+    ax_traj.axis("equal")
 
     #
     basenames = sorted([x.stem for x in seq_dir.glob("image_2/*.png")])
-
-    absA = np.eye(4)
+    ego_pose = np.eye(4)
     for bname_prev, bname_next in zip(basenames[:-1], basenames[1:]):
-        prv_absA = absA
+        prv_ego_pose = ego_pose
 
         I0_prev_path = str(seq_dir / "image_0" / f"{bname_prev}.png")
         I1_prev_path = str(seq_dir / "image_1" / f"{bname_prev}.png")
@@ -340,17 +409,16 @@ def main():
         I0_next = cv2.imread(I0_next_path, cv2.IMREAD_GRAYSCALE)
         I1_next = cv2.imread(I1_next_path, cv2.IMREAD_GRAYSCALE)
 
-        ego_motion = visodo(I0_prev, I1_prev, I0_next, I1_next, P0, P1)
-        absA = absA @ ego_motion
+        ego_motion = visodo(I0_prev, I1_prev, I0_next, I1_next, K, stereo_baseline_meters)
+        ego_pose = ego_pose @ ego_motion
 
-        ax.plot([prv_absA[0, 3], absA[0, 3]], [prv_absA[2, 3], absA[2, 3]])
-        ax_3d.set_xlim(-25, 25)
-        ax_3d.set_ylim(0, 50)
+        ax_traj.plot(
+            [prv_ego_pose[0, 3], ego_pose[0, 3]],
+            [prv_ego_pose[2, 3], ego_pose[2, 3]],
+            color="red",
+        )
         plt.draw()
         plt.pause(0.001)
-
-    ax.axis("equal")
-    plt.show()
 
 
 if __name__ == "__main__":
