@@ -304,7 +304,7 @@ def visodo(
     #    identical to the distance bw the corresponding features in next_frame
     M = np.zeros([num_feats, num_feats])
 
-    consistency_thresh = 0.05  # 0.2  # 0.05  # 0.01
+    consistency_thresh = 0.03
     for i in range(num_feats):
         M[i] = (
             abs(
@@ -325,7 +325,7 @@ def visodo(
         clique = update_clique(potential_nodes, clique, M)
         potential_nodes = find_potential_nodes(clique, M)
 
-    # 그냥 빠르게 처음 나온 potential_nodes를 clique으로 사용할 수도 있다...
+    # Fast version: 그냥 처음 나온 potential_nodes를 clique으로 사용
     # potential_nodes = find_potential_nodes(clique, M)
     # clique = potential_nodes
 
@@ -418,7 +418,8 @@ def main():
             color="red",
         )
         plt.draw()
-        plt.pause(0.001)
+        plt.pause(0.1)
+    plt.show()
 
 
 if __name__ == "__main__":
